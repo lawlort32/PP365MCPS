@@ -1,0 +1,424 @@
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+import { DataverseClient } from "../dataverse-client.js";
+import { OptionSetMetadata, OptionMetadata, ODataResponse, LocalizedLabel } from "../types.js";
+
+// Helper function to create localized labels
+function createLocalizedLabel(text: string, languageCode: number = 1033): LocalizedLabel {
+  return {
+    LocalizedLabels: [
+      {
+        Label: text,
+        LanguageCode: languageCode,
+        IsManaged: false,
+        MetadataId: "00000000-0000-0000-0000-000000000000"
+      }
+    ],
+    UserLocalizedLabel: {
+      Label: text,
+      LanguageCode: languageCode,
+      IsManaged: false,
+      MetadataId: "00000000-0000-0000-0000-000000000000"
+    }
+  };
+}
+
+export function createOptionSetTool(server: McpServer, client: DataverseClient) {
+  server.registerTool(
+    "create_dataverse_optionset",
+    {
+      title: "Create Dataverse Option Set",
+      description: "Creates a new global option set (choice list) in Dataverse with predefined options. Use this to create reusable choice lists that can be used across multiple tables and columns. Option sets provide consistent data entry options and improve data quality.",
+      inputSchema: {
+        name: z.string().describe("Name for the option set (e.g., 'new_priority')"),
+        displayName: z.string().describe("Display name for the option set"),
+        description: z.string().optional().describe("Description of the option set"),
+        isGlobal: z.boolean().default(true).describe("Whether this is a global option set"),
+        options: z.array(z.object({
+          value: z.number().describe("Numeric value for the option"),
+          label: z.string().describe("Display label for the option"),
+          description: z.string().optional().describe("Description for the option"),
+          color: z.string().optional().describe("Color for the option (hex format, e.g., '#FF0000')")
+        })).describe("Array of options for the option set")
+      }
+    },
+    async (params) => {
+      try {
+        if (!params.options || params.options.length === 0) {
+          throw new Error("At least one option is required");
+        }
+
+        const optionSetDefinition = {
+          "@odata.type": "Microsoft.Dynamics.CRM.OptionSetMetadata",
+          Name: params.name,
+          DisplayName: createLocalizedLabel(params.displayName),
+          Description: params.description ? createLocalizedLabel(params.description) : undefined,
+          OptionSetType: "Picklist", // Use string instead of numeric
+          IsGlobal: params.isGlobal,
+          IsCustomOptionSet: true,
+          Options: params.options.map(option => ({
+            Value: option.value,
+            Label: createLocalizedLabel(option.label),
+            Description: option.description ? createLocalizedLabel(option.description) : undefined,
+            Color: option.color,
+            IsManaged: false
+          }))
+        };
+
+        const result = await client.postMetadata("GlobalOptionSetDefinitions", optionSetDefinition);
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Successfully created option set '${params.name}' with ${params.options.length} options.\n\nResponse: ${JSON.stringify(result, null, 2)}`
+            }
+          ]
+        };
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error creating option set: ${error instanceof Error ? error.message : 'Unknown error'}`
+            }
+          ],
+          isError: true
+        };
+      }
+    }
+  );
+}
+
+export function getOptionSetTool(server: McpServer, client: DataverseClient) {
+  server.registerTool(
+    "get_dataverse_optionset",
+    {
+      title: "Get Dataverse Option Set",
+      description: "Retrieves detailed information about a specific option set including its metadata, options, and configuration. Use this to inspect option set definitions and understand available choices.",
+      inputSchema: {
+        name: z.string().describe("Name of the option set to retrieve")
+      }
+    },
+    async (params) => {
+      try {
+        const result = await client.getMetadata<OptionSetMetadata>(
+          `GlobalOptionSetDefinitions(Name='${params.name}')`
+        );
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Option set information for '${params.name}':\n\n${JSON.stringify(result, null, 2)}`
+            }
+          ]
+        };
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error retrieving option set: ${error instanceof Error ? error.message : 'Unknown error'}`
+            }
+          ],
+          isError: true
+        };
+      }
+    }
+  );
+}
+
+export function updateOptionSetTool(server: McpServer, client: DataverseClient) {
+  server.registerTool(
+    "update_dataverse_optionset",
+    {
+      title: "Update Dataverse Option Set",
+      description: "Updates an existing option set by modifying its properties and managing its options. Use this to add new choices, update existing ones, remove obsolete options, or change the option set's display name and description. Changes affect all columns using this option set.",
+      inputSchema: {
+        name: z.string().describe("Name of the option set to update"),
+        displayName: z.string().optional().describe("New display name for the option set"),
+        description: z.string().optional().describe("New description of the option set"),
+        addOptions: z.array(z.object({
+          value: z.number().describe("Numeric value for the new option"),
+          label: z.string().describe("Display label for the new option"),
+          description: z.string().optional().describe("Description for the new option"),
+          color: z.string().optional().describe("Color for the new option (hex format)")
+        })).optional().describe("New options to add to the option set"),
+        updateOptions: z.array(z.object({
+          value: z.number().describe("Numeric value of the option to update"),
+          label: z.string().optional().describe("New display label for the option"),
+          description: z.string().optional().describe("New description for the option"),
+          color: z.string().optional().describe("New color for the option (hex format)")
+        })).optional().describe("Existing options to update"),
+        removeOptions: z.array(z.number()).optional().describe("Values of options to remove from the option set")
+      }
+    },
+    async (params) => {
+      try {
+        // Update basic properties if provided
+        if (params.displayName || params.description) {
+          // First, retrieve the current option set definition to get MetadataId
+          const currentOptionSet = await client.getMetadata<OptionSetMetadata>(
+            `GlobalOptionSetDefinitions(Name='${params.name}')`
+          );
+
+          // Create the updated option set definition by merging current with new values
+          const updatedOptionSet: any = {
+            ...currentOptionSet,
+            "@odata.type": "Microsoft.Dynamics.CRM.OptionSetMetadata"
+          };
+
+          // Update only the specified properties
+          if (params.displayName) {
+            updatedOptionSet.DisplayName = createLocalizedLabel(params.displayName);
+          }
+          if (params.description) {
+            updatedOptionSet.Description = createLocalizedLabel(params.description);
+          }
+
+          // Use PUT method with MetadataId as per Microsoft documentation
+          // Only OptionSetMetadataBase properties can be updated this way
+          await client.putMetadata(
+            `GlobalOptionSetDefinitions(${currentOptionSet.MetadataId})`,
+            updatedOptionSet,
+            {
+              'MSCRM.MergeLabels': 'true'
+            }
+          );
+        }
+
+        // Add new options using InsertOptionValue action
+        if (params.addOptions && params.addOptions.length > 0) {
+          for (const option of params.addOptions) {
+            const insertOptionData = {
+              OptionSetName: params.name,
+              Value: option.value,
+              Label: createLocalizedLabel(option.label),
+              Description: option.description ? createLocalizedLabel(option.description) : undefined,
+              Color: option.color
+            };
+
+            await client.callAction("InsertOptionValue", insertOptionData);
+          }
+        }
+
+        // Remove options using DeleteOptionValue action
+        if (params.removeOptions && params.removeOptions.length > 0) {
+          for (const optionValue of params.removeOptions) {
+            const deleteOptionData = {
+              OptionSetName: params.name,
+              Value: optionValue
+            };
+
+            await client.callAction("DeleteOptionValue", deleteOptionData);
+          }
+        }
+
+        // Update existing options using UpdateOptionValue action
+        if (params.updateOptions && params.updateOptions.length > 0) {
+          for (const option of params.updateOptions) {
+            const updateOptionData: any = {
+              OptionSetName: params.name,
+              Value: option.value,
+              MergeLabels: true  // Required parameter for UpdateOptionValue action
+            };
+
+            // Only include properties that are being updated
+            if (option.label) {
+              updateOptionData.Label = createLocalizedLabel(option.label);
+            }
+            if (option.description) {
+              updateOptionData.Description = createLocalizedLabel(option.description);
+            }
+            if (option.color) {
+              updateOptionData.Color = option.color;
+            }
+
+            await client.callAction("UpdateOptionValue", updateOptionData);
+          }
+        }
+
+        let message = `Successfully updated option set '${params.name}'.`;
+        if (params.addOptions?.length) {
+          message += ` Added ${params.addOptions.length} options.`;
+        }
+        if (params.updateOptions?.length) {
+          message += ` Updated ${params.updateOptions.length} options.`;
+        }
+        if (params.removeOptions?.length) {
+          message += ` Removed ${params.removeOptions.length} options.`;
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: message
+            }
+          ]
+        };
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error updating option set: ${error instanceof Error ? error.message : 'Unknown error'}`
+            }
+          ],
+          isError: true
+        };
+      }
+    }
+  );
+}
+
+export function deleteOptionSetTool(server: McpServer, client: DataverseClient) {
+  server.registerTool(
+    "delete_dataverse_optionset",
+    {
+      title: "Delete Dataverse Option Set",
+      description: "Permanently deletes an option set from Dataverse. WARNING: This action cannot be undone and will fail if the option set is being used by any columns. Ensure no columns reference this option set before deletion.",
+      inputSchema: {
+        name: z.string().describe("Name of the option set to delete")
+      }
+    },
+    async (params) => {
+      try {
+        await client.deleteMetadata(`GlobalOptionSetDefinitions(Name='${params.name}')`);
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Successfully deleted option set '${params.name}'.`
+            }
+          ]
+        };
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error deleting option set: ${error instanceof Error ? error.message : 'Unknown error'}`
+            }
+          ],
+          isError: true
+        };
+      }
+    }
+  );
+}
+
+export function listOptionSetsTool(server: McpServer, client: DataverseClient) {
+  server.registerTool(
+    "list_dataverse_optionsets",
+    {
+      title: "List Dataverse Option Sets",
+      description: "Retrieves a list of option sets in the Dataverse environment with filtering options. Use this to discover available choice lists, find custom option sets, or get an overview of reusable options. Supports filtering by custom/system and managed/unmanaged status.",
+      inputSchema: {
+        customOnly: z.boolean().default(false).describe("Whether to list only custom option sets"),
+        includeManaged: z.boolean().default(false).describe("Whether to include managed option sets"),
+        top: z.number().optional().describe("Maximum number of option sets to return (default: 50)"),
+        filter: z.string().optional().describe("OData filter expression")
+      }
+    },
+    async (params) => {
+      try {
+        // Note: $filter is not supported on GlobalOptionSetDefinitions
+        let queryParams: Record<string, any> = {
+          $select: "Name,DisplayName,Description,IsCustomOptionSet,IsManaged,IsGlobal,OptionSetType"
+        };
+
+        // Add top parameter if specified
+        if (params.top) {
+          queryParams.$top = params.top;
+        }
+
+        const result = await client.getMetadata<ODataResponse<OptionSetMetadata>>(
+          "GlobalOptionSetDefinitions",
+          queryParams
+        );
+
+        const optionSetList = result.value.map(optionSet => ({
+          name: optionSet.Name,
+          displayName: optionSet.DisplayName?.UserLocalizedLabel?.Label || optionSet.Name,
+          description: optionSet.Description?.UserLocalizedLabel?.Label || "",
+          isCustom: optionSet.IsCustomOptionSet,
+          isManaged: optionSet.IsManaged,
+          isGlobal: optionSet.IsGlobal,
+          optionSetType: optionSet.OptionSetType,
+          optionCount: optionSet.Options?.length || 0
+        }));
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Found ${optionSetList.length} option sets:\n\n${JSON.stringify(optionSetList, null, 2)}`
+            }
+          ]
+        };
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error listing option sets: ${error instanceof Error ? error.message : 'Unknown error'}`
+            }
+          ],
+          isError: true
+        };
+      }
+    }
+  );
+}
+
+// Additional tool to get option set options/values
+export function getOptionSetOptionsTool(server: McpServer, client: DataverseClient) {
+  server.registerTool(
+    "get_dataverse_optionset_options",
+    {
+      title: "Get Dataverse Option Set Options",
+      description: "Retrieves all options (choices) within a specific option set, including their values, labels, descriptions, and colors. Use this to inspect the available choices in an option set and understand their configuration.",
+      inputSchema: {
+        name: z.string().describe("Name of the option set to get options for")
+      }
+    },
+    async (params) => {
+      try {
+        // Get the option set with its options - this should work as we've seen it does
+        const result = await client.getMetadata<OptionSetMetadata>(
+          `GlobalOptionSetDefinitions(Name='${params.name}')`
+        );
+
+        const options = result.Options?.map(option => ({
+          value: option.Value,
+          label: option.Label?.UserLocalizedLabel?.Label || "",
+          description: option.Description?.UserLocalizedLabel?.Label || "",
+          color: option.Color,
+          isManaged: option.IsManaged
+        })) || [];
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Options for option set '${params.name}':\n\n${JSON.stringify(options, null, 2)}`
+            }
+          ]
+        };
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error retrieving option set options: ${error instanceof Error ? error.message : 'Unknown error'}`
+            }
+          ],
+          isError: true
+        };
+      }
+    }
+  );
+}
